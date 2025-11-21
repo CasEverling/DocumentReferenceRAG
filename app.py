@@ -1,155 +1,200 @@
 # app.py
-import os
-import json
 import base64
-
+import os
 from flask import Flask, request, jsonify, send_file
-
 from manual_database import ManualDatabase
-from process_manual import process_manual, MANUALS_DIR, PAGES_DIR, CROPS_DIR
-
+from process_manual import process_manual, pdf_to_pages
+from gpt_vision import client
+import sqlite3
+import io
+import fitz
 
 app = Flask(__name__)
 
+# Storage directory for uploaded manuals
+MANUAL_PDF_DIR = "manual_storage"
+os.makedirs(MANUAL_PDF_DIR, exist_ok=True)
 
+
+# --------------------------
+#  CREATE TABLES
+# --------------------------
+@app.route("/create_tables", methods=["POST"])
+def create_tables():
+    db = ManualDatabase()
+    return jsonify({"status": "tables created"})
+
+
+# --------------------------
+#  UPLOAD + PROCESS MANUAL
+# --------------------------
 @app.route("/process_manual", methods=["POST"])
-def api_process_manual():
+def route_process_manual():
     """
-    Body JSON:
+    Body (JSON):
     {
-      "pdf_base64": "<base64PDF>",
-      "make": "Ford",
-      "model": "Crown Victoria",
-      "year": 2010,
-      "police_or_civil": "Police"
+        "pdf_base64": "<b64>",
+        "make": "Ford",
+        "model": "Crown Vic",
+        "year": 2010,
+        "police_or_civil": "Police"
     }
     """
+
     try:
-        data = request.get_json(force=True)
+        data = request.get_json()
         pdf_b64 = data["pdf_base64"]
         make = data["make"]
         model = data["model"]
         year = int(data["year"])
         police_or_civil = data["police_or_civil"]
 
+        # Decode PDF
         pdf_bytes = base64.b64decode(pdf_b64)
-        tmp_path = os.path.join("data", "upload_temp.pdf")
-        with open(tmp_path, "wb") as f:
+        pdf_path = os.path.join(MANUAL_PDF_DIR, "upload_temp.pdf")
+        with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
 
+        # Process manual
         manual_id = process_manual(
-            pdf_path=tmp_path,
+            pdf_path=pdf_path,
             make=make,
             model=model,
             year=year,
-            police_or_civil=police_or_civil,
+            police_or_civil=police_or_civil
         )
+
+        # Save a permanent copy of the PDF
+        final_pdf_path = os.path.join(MANUAL_PDF_DIR, f"{manual_id}.pdf")
+        os.rename(pdf_path, final_pdf_path)
 
         return jsonify({"manual_id": manual_id})
 
     except Exception as e:
-        print(f"Error in /process_manual: {e}")
+        print("Error in /process_manual:", e)
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/get_page/<int:manual_id>/<int:page>", methods=["GET"])
-def api_get_page(manual_id: int, page: int):
-    """
-    Returns the rendered page PNG.
-    """
-    page_path = os.path.join(PAGES_DIR, f"{manual_id}_{page}.png")
-    if not os.path.exists(page_path):
-        return jsonify({"error": "Page not found"}), 404
-
-    return send_file(page_path, mimetype="image/png")
-
-
+# --------------------------
+#  GET REFERENCES ENDPOINT
+# --------------------------
 @app.route("/get_references", methods=["POST"])
-def api_get_references():
+def get_references():
     """
-    Body JSON:
+    Input:
     {
-      "manual_id": 123,
-      "message": "How do I replace the front brake pads?"
+        "manual_id": 6,
+        "query": "How do I remove the rear seat?"
     }
 
-    Returns:
+    Output:
     {
-      "sections": [
-        {"manual_id": 123, "page_number": 5, "section_name": "..."},
-        ...
-      ],
-      "images": [
-        {"image_id": 42, "page_number": 5, "image_base64": "..."},
-        ...
-      ]
+        "sections": [...],
+        "images": [...]
     }
     """
+
     try:
-        data = request.get_json(force=True)
+        data = request.get_json()
         manual_id = int(data["manual_id"])
-        message = data["message"]
+        query = data["query"]
 
         db = ManualDatabase()
-        manual = db.get_manual(manual_id)
-        if not manual:
-            return jsonify({"error": "Manual not found"}), 404
 
-        sections = db.get_sections_by_manual(manual_id)
-        images = db.get_images_by_manual(manual_id)
+        # Get all headings
+        conn = db.conn
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT Level, Page, Description FROM SECTIONS
+            WHERE ManualId = ?
+        """, (manual_id,))
+        sections = cur.fetchall()
 
-        # --- Simple heuristic: return all for now or filter later using GPT ---
-        # You can later add a GPT call to choose the best subset based on `message`.
+        # Create a prompt for GPT to choose best references
+        section_text = "\n".join(
+            [f"[p{p}] (L{lvl}) {desc}" for (lvl, p, desc) in sections]
+        )
 
-        sections_out = [
-            {
-                "manual_id": s[1],
-                "page_number": s[3],
-                "section_name": s[5],
-            }
-            for s in sections
-        ]
+        prompt = f"""
+You are a retrieval system for a vehicle service manual.
 
-        images_out = []
-        for img in images:
-            image_id = img[0]
-            page_number = img[2]
-            crop_path = os.path.join(CROPS_DIR, f"{image_id}.png")
+User query:
+"{query}"
 
-            if os.path.exists(crop_path):
-                with open(crop_path, "rb") as f:
-                    b64_img = base64.b64encode(f.read()).decode("utf-8")
-            else:
-                b64_img = None
+Here are the available manual sections:
+{section_text}
 
-            images_out.append(
-                {
-                    "image_id": image_id,
-                    "page_number": page_number,
-                    "image_base64": b64_img,
-                }
-            )
+Return a JSON object with two arrays:
+- sections: list of objects {{page, description}}
+- images: list of objects {{page, description}}
 
-        return jsonify(
-            {
-                "manual": {
-                    "ManualId": manual[0],
-                    "Make": manual[1],
-                    "Model": manual[2],
-                    "Year": manual[3],
-                    "PoliceOrCivil": manual[4],
-                },
-                "message": message,
-                "sections": sections_out,
-                "images": images_out,
-            }
+Only include the most relevant results.
+Return ONLY JSON.
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Validate JSON safely
+        import json
+        return jsonify(json.loads(raw))
+
+    except Exception as e:
+        print("Error in /get_references:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------
+#  GET FULL PAGE IMAGE
+# --------------------------
+@app.route("/get_page", methods=["POST"])
+def get_page():
+    """
+    Input:
+    {
+        "manual_id": 6,
+        "page": 3
+    }
+
+    Returns raw PNG image of that page.
+    """
+    try:
+        data = request.get_json()
+        manual_id = int(data["manual_id"])
+        page_index = int(data["page"]) - 1  # zero-based
+
+        pdf_path = os.path.join(MANUAL_PDF_DIR, f"{manual_id}.pdf")
+        if not os.path.exists(pdf_path):
+            return jsonify({"error": "PDF not found"}), 404
+
+        doc = fitz.open(pdf_path)
+        if page_index >= len(doc):
+            return jsonify({"error": "Page out of range"}), 400
+
+        pix = doc[page_index].get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("png")
+
+        return send_file(
+            io.BytesIO(img_bytes),
+            mimetype="image/png",
+            as_attachment=False,
+            download_name=f"manual_{manual_id}_page_{page_index+1}.png"
         )
 
     except Exception as e:
-        print(f"Error in /get_references: {e}")
+        print("Error in /get_page:", e)
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"message": "Manual Processing API is running"})
+
+
 if __name__ == "__main__":
-    # Dev mode
     app.run(host="0.0.0.0", port=8000, debug=True)
