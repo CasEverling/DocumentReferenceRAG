@@ -1,14 +1,18 @@
 # manual_database.py
-from db_sqlite import DataBase
+import sqlite3
+import os
 
+DB_PATH = "data/Manuals.db"
 
-class ManualDatabase(DataBase):
+class ManualDatabase:
     def __init__(self):
-        super().__init__()
-        self._ensure_tables()
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        self.conn = sqlite3.connect(DB_PATH)
+        self.cursor = self.conn.cursor()
+        self._create_tables()
 
-    def _ensure_tables(self):
-        self.execute("""
+    def _create_tables(self):
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS MANUAL (
                 ManualId INTEGER PRIMARY KEY AUTOINCREMENT,
                 Make TEXT,
@@ -18,18 +22,17 @@ class ManualDatabase(DataBase):
             );
         """)
 
-        self.execute("""
-            CREATE TABLE IF NOT EXISTS SEARCH (
-                ManualSectionId INTEGER PRIMARY KEY AUTOINCREMENT,
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS SECTIONS (
+                SectionId INTEGER PRIMARY KEY AUTOINCREMENT,
                 ManualId INTEGER,
-                ParentSectionId INTEGER,
-                StartPage INTEGER,
-                EndPage INTEGER,
-                SectionName TEXT
+                Level INTEGER,
+                Page INTEGER,
+                Description TEXT
             );
         """)
 
-        self.execute("""
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS IMAGES (
                 ImageId INTEGER PRIMARY KEY AUTOINCREMENT,
                 ManualId INTEGER,
@@ -42,35 +45,33 @@ class ManualDatabase(DataBase):
             );
         """)
 
-    # --- Inserts ---
-    def add_manual(self, make: str, model: str, year: int, police_or_civil: str) -> int:
-        self.execute(
+        self.conn.commit()
+
+    # ---- Insertions ----
+    def add_manual(self, make, model, year, police_or_civil):
+        self.cursor.execute(
             "INSERT INTO MANUAL (Make, Model, Year, PoliceOrCivil) VALUES (?, ?, ?, ?)",
-            (make, model, year, police_or_civil),
+            (make, model, year, police_or_civil)
         )
+        self.conn.commit()
         return self.cursor.lastrowid
 
-    def add_section(self, manual_id: int, parent_section_id, start_page: int, end_page: int, name: str) -> int:
-        self.execute(
-            "INSERT INTO SEARCH (ManualId, ParentSectionId, StartPage, EndPage, SectionName) VALUES (?, ?, ?, ?, ?)",
-            (manual_id, parent_section_id, start_page, end_page, name),
+    def add_section(self, manual_id, level, page, description):
+        self.cursor.execute(
+            "INSERT INTO SECTIONS (ManualId, Level, Page, Description) VALUES (?, ?, ?, ?)",
+            (manual_id, level, page, description)
         )
-        return self.cursor.lastrowid
+        self.conn.commit()
 
-    def add_image(self, manual_id: int, page: int, x: float, y: float, w: float, h: float, desc: str) -> int:
-        self.execute(
+    def add_image(self, manual_id, page, x, y, w, h, desc):
+        self.cursor.execute(
             "INSERT INTO IMAGES (ManualId, Page, X, Y, W, H, Description) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (manual_id, page, x, y, w, h, desc),
+            (manual_id, page, x, y, w, h, desc)
         )
-        return self.cursor.lastrowid
+        self.conn.commit()
 
-    # --- Queries ---
-    def get_manual(self, manual_id: int):
-        rows = self.query("SELECT * FROM MANUAL WHERE ManualId = ?", (manual_id,))
-        return rows[0] if rows else None
-
-    def get_sections_by_manual(self, manual_id: int):
-        return self.query("SELECT * FROM SEARCH WHERE ManualId = ?", (manual_id,))
-
-    def get_images_by_manual(self, manual_id: int):
-        return self.query("SELECT * FROM IMAGES WHERE ManualId = ?", (manual_id,))
+    def __del__(self):
+        try:
+            self.conn.close()
+        except:
+            pass
